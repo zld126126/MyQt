@@ -6,6 +6,8 @@
 #include <QFileDialog>
 #include <QDateTime>
 #include <QMessageBox>
+#include <QThread>
+#include <QMutexLocker>
 
 // 声明C接口
 extern "C" {
@@ -17,10 +19,85 @@ extern "C" {
     void camera_cleanup();      // 清理摄像头资源
 }
 
+// CameraThread类实现
+CameraThread::CameraThread(QObject *parent)
+    : QThread(parent)
+    , m_isRunning(false)
+    , m_rgbData(nullptr)
+    , m_rgbDataLen(0)
+{
+}
+
+CameraThread::~CameraThread()
+{
+    stop();
+    wait(); // 等待线程结束
+}
+
+void CameraThread::stop()
+{
+    m_isRunning = false;
+}
+
+unsigned char* CameraThread::getRGBData() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_rgbData;
+}
+
+unsigned int CameraThread::getRGBDataLen() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_rgbDataLen;
+}
+
+void CameraThread::run()
+{
+    // 在线程中初始化摄像头
+    m_isRunning = true;
+    int initResult = camera_init();
+    bool success = (initResult == 0);
+    
+    // 发送初始化完成信号
+    emit initFinished(success);
+    
+    if (!success) {
+        return;
+    }
+    
+    while (m_isRunning) {
+        // 调用C接口捕获一帧（生成RGB数据）
+        int captureRet = camera_capture();
+        if (captureRet == 0) {
+            // 获取RGB数据（调用C接口）并更新线程内的成员变量
+            QMutexLocker locker(&m_mutex);
+            m_rgbData = get_rgb_data();
+            m_rgbDataLen = get_rgb_data_len();
+            
+            // 释放锁后再发送信号，避免死锁
+            locker.unlock();
+            
+            // 发送帧捕获完成信号
+            emit frameCaptured();
+        } else {
+            qWarning() << "Capture frame failed in thread, code:" << captureRet;
+        }
+        
+        // 控制帧率（约10fps）
+        msleep(100);
+    }
+    
+    // 清理摄像头资源
+    camera_cleanup();
+    free_rgb_data();
+}
+
+// MyThreadCamera类实现
 MyThreadCamera::MyThreadCamera(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MyThreadCamera)
     , m_isCapturing(false)
+    , m_initSuccess(false)
 {
     ui->setupUi(this);
 
@@ -28,44 +105,28 @@ MyThreadCamera::MyThreadCamera(QWidget *parent)
     m_cameraLabel->setAlignment(Qt::AlignCenter);
     m_cameraLabel->setText("点击开始按钮启动摄像头...");
 
-    // 初始化计时器
-    m_captureTimer = new QTimer(this);
-    m_captureTimer->setInterval(100); // 间隔100ms，约10fps
-    connect(m_captureTimer, &QTimer::timeout, this, &MyThreadCamera::onCaptureFrame);
-
-    // 初始化摄像头（但不立即开始捕获）
-    m_initSuccess = (camera_init() == 0);
-    if (!m_initSuccess) {
-        m_cameraLabel->setText("摄像头初始化失败！");
-        ui->pushButton_start->setEnabled(false);
-        qCritical() << "Camera init failed";
-    }
+    // 初始化摄像头线程
+    m_cameraThread = new CameraThread(this);
+    connect(m_cameraThread, &CameraThread::frameCaptured, this, &MyThreadCamera::onFrameCaptured);
+    connect(m_cameraThread, &CameraThread::initFinished, this, &MyThreadCamera::onInitFinished);
 }
 
 MyThreadCamera::~MyThreadCamera()
 {
     stopCapture();
-
+    
     // 清理资源
-    free_rgb_data();
-    camera_cleanup();
-    delete m_captureTimer;
+    delete m_cameraThread;
     delete ui;
 }
 
-// 定时捕获图像的槽函数
-void MyThreadCamera::onCaptureFrame()
+// 处理帧捕获完成的槽函数
+void MyThreadCamera::onFrameCaptured()
 {
-    // 调用C接口捕获一帧（生成RGB数据）
-    int captureRet = camera_capture();
-    if (captureRet != 0) {
-        qWarning() << "Capture frame failed, code:" << captureRet;
-        return;
-    }
-
-    // 获取RGB数据（调用C接口）
-    unsigned char *rgbData = get_rgb_data();
-    unsigned int rgbLen = get_rgb_data_len();
+    // 获取RGB数据
+    unsigned char *rgbData = m_cameraThread->getRGBData();
+    unsigned int rgbLen = m_cameraThread->getRGBDataLen();
+    
     if (rgbData == NULL || rgbLen == 0) {
         qWarning() << "RGB data is empty!";
         return;
@@ -87,21 +148,27 @@ void MyThreadCamera::onCaptureFrame()
     m_cameraLabel->setPixmap(pixmap);
 }
 
+// 处理初始化完成的槽函数
+void MyThreadCamera::onInitFinished(bool success)
+{
+    m_initSuccess = success;
+    if (!success) {
+        m_cameraLabel->setText("摄像头初始化失败！");
+        ui->pushButton_start->setEnabled(false);
+        qCritical() << "Camera init failed";
+    }
+}
+
 // 开始捕获按钮点击事件
 void MyThreadCamera::on_pushButton_start_clicked()
 {
-    if (!m_initSuccess) {
-        QMessageBox::warning(this, "初始化失败", "摄像头初始化失败，无法启动");
-        return;
-    }
-
-    if (!m_isCapturing) {
-        m_captureTimer->start();
+    if (!m_isCapturing && !m_cameraThread->isRunning()) {
+        m_cameraThread->start();
         m_isCapturing = true;
         ui->pushButton_start->setText("正在捕获...");
         ui->pushButton_start->setEnabled(false);
         ui->pushButton_stop->setEnabled(true);
-        m_cameraLabel->setText("正在显示摄像头画面...");
+        m_cameraLabel->setText("正在初始化摄像头并显示画面...");
     }
 }
 
@@ -122,7 +189,8 @@ void MyThreadCamera::on_pushButton_stop_clicked()
 void MyThreadCamera::stopCapture()
 {
     if (m_isCapturing) {
-        m_captureTimer->stop();
+        m_cameraThread->stop();
+        m_cameraThread->wait(); // 等待线程结束
         m_isCapturing = false;
         ui->pushButton_start->setText("开始捕获");
         ui->pushButton_start->setEnabled(true);
