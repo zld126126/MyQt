@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/">
+        <file>1.avi</file>
+        <file>2.avi</file>
+        <file>3.avi</file>
+    </qresource>
+</RCC>
